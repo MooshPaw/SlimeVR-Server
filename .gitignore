@@ -53,3 +53,10 @@ vrconfig.yml.tmp
 
 # Nixos
 .bin/
+
+# AI coding assistant folders
+.claude/
+.cursor/
+.windsurf/
+.continue/
+.aider*

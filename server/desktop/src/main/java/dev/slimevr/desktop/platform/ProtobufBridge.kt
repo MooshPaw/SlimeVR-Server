@@ -1,10 +1,13 @@
 package dev.slimevr.desktop.platform
 
+import dev.slimevr.VRServer.Companion.getNextLocalTrackerId
 import dev.slimevr.VRServer.Companion.instance
 import dev.slimevr.bridge.BridgeThread
 import dev.slimevr.bridge.ISteamVRBridge
 import dev.slimevr.desktop.platform.ProtobufMessages.*
+import dev.slimevr.tracking.trackers.DeviceOrigin
 import dev.slimevr.tracking.trackers.Tracker
+import dev.slimevr.tracking.trackers.TrackerPosition
 import dev.slimevr.tracking.trackers.TrackerStatus
 import dev.slimevr.tracking.trackers.TrackerStatus.Companion.getById
 import dev.slimevr.tracking.trackers.TrackerUtils
@@ -36,6 +39,13 @@ abstract class ProtobufBridge(@JvmField protected val bridgeName: String) : ISte
 	@Synchronize("self")
 	private val remoteTrackersByTrackerId: MutableMap<Int, Tracker> = HashMap()
 	private var hadNewData = false
+
+	/**
+	 * Synthetic per-finger-bone trackers derived from HandSkeleton messages,
+	 * keyed by the hand's tracker_id, then indexed by FingerBone ordinal (0-14).
+	 */
+	@Synchronize("self")
+	private val handSkeletonTrackers: MutableMap<Int, Array<Tracker?>> = HashMap()
 
 	/**
 	 * Wakes the bridge thread, implementation is platform-specific.
@@ -157,6 +167,8 @@ abstract class ProtobufBridge(@JvmField protected val bridgeName: String) : ISte
 			batteryReceived(message.battery)
 		} else if (message.hasVersion()) {
 			versionReceived(message.version)
+		} else if (message.hasHandSkeleton()) {
+			handSkeletonReceived(message.handSkeleton)
 		}
 	}
 
@@ -210,6 +222,76 @@ abstract class ProtobufBridge(@JvmField protected val bridgeName: String) : ISte
 	@VRServerThread
 	protected open fun batteryReceived(batteryMessage: Battery) {
 		return
+	}
+
+	/**
+	 * Finger bone rotations gathered from SteamVR skeletal input, forwarded by the
+	 * feeder app. Creates/updates one synthetic, computed Tracker per bone, unless
+	 * a real (non-computed) tracker - e.g. a flex sensor glove - is already active
+	 * at that TrackerPosition, in which case the hardware tracker takes priority
+	 * and this bone is skipped.
+	 */
+	@VRServerThread
+	protected fun handSkeletonReceived(handSkeleton: HandSkeleton) {
+		val handTracker = getInternalRemoteTrackerById(handSkeleton.handTrackerId) ?: return
+		val isLeft = when (handTracker.trackerPosition) {
+			TrackerPosition.LEFT_HAND -> true
+			TrackerPosition.RIGHT_HAND -> false
+			else -> return
+		}
+
+		val boneTrackers = synchronized(handSkeletonTrackers) {
+			handSkeletonTrackers.getOrPut(handSkeleton.handTrackerId) { arrayOfNulls(15) }
+		}
+		val allTrackers = instance.allTrackers
+
+		for (boneRotation in handSkeleton.bonesList) {
+			val boneOrdinal = boneRotation.boneValue
+			if (boneOrdinal < 0 || boneOrdinal >= 15) continue
+
+			val trackerPosition = TrackerPosition.getById((if (isLeft) 21 else 36) + boneOrdinal) ?: continue
+
+			// Hardware (e.g. flex sensor gloves) always takes priority over SteamVR
+			// skeletal data for the same finger bone.
+			val hardwarePresent = allTrackers.any {
+				it.trackerPosition == trackerPosition && !it.isComputed && !it.isInternal && !it.status.reset
+			}
+
+			var tracker = boneTrackers[boneOrdinal]
+			if (hardwarePresent) {
+				// Hand back priority to the hardware tracker by disconnecting ours,
+				// so skeleton resolution picks the hardware tracker instead.
+				tracker?.let { it.status = TrackerStatus.DISCONNECTED }
+				continue
+			}
+
+			if (tracker == null) {
+				val device = instance.deviceManager.createDevice(
+					DeviceOrigin.STEAMVR,
+					"OpenVR Hand Skeleton (${if (isLeft) "Left" else "Right"})",
+					null,
+					"OpenVR",
+				)
+				tracker = Tracker(
+					device,
+					getNextLocalTrackerId(),
+					"$bridgeName:${trackerPosition.designation}",
+					trackerPosition.designation,
+					trackerPosition,
+					trackerNum = boneOrdinal,
+					hasRotation = true,
+					isComputed = true,
+				)
+				device.trackers[boneOrdinal] = tracker
+				instance.deviceManager.addDevice(device)
+				instance.registerTracker(tracker)
+				boneTrackers[boneOrdinal] = tracker
+			}
+
+			tracker.status = TrackerStatus.OK
+			tracker.setRotation(Quaternion(boneRotation.qw, boneRotation.qx, boneRotation.qy, boneRotation.qz))
+			tracker.dataTick()
+		}
 	}
 
 	@VRServerThread
