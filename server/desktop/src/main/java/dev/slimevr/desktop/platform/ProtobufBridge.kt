@@ -5,7 +5,6 @@ import dev.slimevr.VRServer.Companion.instance
 import dev.slimevr.bridge.BridgeThread
 import dev.slimevr.bridge.ISteamVRBridge
 import dev.slimevr.desktop.platform.ProtobufMessages.*
-import dev.slimevr.tracking.trackers.DeviceOrigin
 import dev.slimevr.tracking.trackers.Tracker
 import dev.slimevr.tracking.trackers.TrackerPosition
 import dev.slimevr.tracking.trackers.TrackerStatus
@@ -41,8 +40,10 @@ abstract class ProtobufBridge(@JvmField protected val bridgeName: String) : ISte
 	private var hadNewData = false
 
 	/**
-	 * Synthetic per-finger-bone trackers derived from HandSkeleton messages,
-	 * keyed by the hand's tracker_id, then indexed by FingerBone ordinal (0-14).
+	 * Per-finger-bone trackers derived from HandSkeleton messages, keyed by the
+	 * hand's tracker_id, then indexed by FingerBone ordinal (0-14). These have no
+	 * backing Device and are never passed to deviceManager, so they feed the
+	 * skeleton as input without appearing as trackers in the UI.
 	 */
 	@Synchronize("self")
 	private val handSkeletonTrackers: MutableMap<Int, Array<Tracker?>> = HashMap()
@@ -226,10 +227,12 @@ abstract class ProtobufBridge(@JvmField protected val bridgeName: String) : ISte
 
 	/**
 	 * Finger bone rotations gathered from SteamVR skeletal input, forwarded by the
-	 * feeder app. Creates/updates one synthetic, computed Tracker per bone, unless
-	 * a real (non-computed) tracker - e.g. a flex sensor glove - is already active
-	 * at that TrackerPosition, in which case the hardware tracker takes priority
-	 * and this bone is skipped.
+	 * feeder app. Creates/updates one device-less Tracker per bone, unless a real
+	 * (non-computed) tracker - e.g. a flex sensor glove - is already active at
+	 * that TrackerPosition, in which case the hardware tracker takes priority and
+	 * this bone is skipped. These trackers are registered directly on the server
+	 * (bypassing deviceManager) so they drive the skeleton's finger bones without
+	 * showing up as separate trackers in the UI.
 	 */
 	@VRServerThread
 	protected fun handSkeletonReceived(handSkeleton: HandSkeleton) {
@@ -266,14 +269,13 @@ abstract class ProtobufBridge(@JvmField protected val bridgeName: String) : ISte
 			}
 
 			if (tracker == null) {
-				val device = instance.deviceManager.createDevice(
-					DeviceOrigin.STEAMVR,
-					"OpenVR Hand Skeleton (${if (isLeft) "Left" else "Right"})",
-					null,
-					"OpenVR",
-				)
+				// No backing Device, and never passed to deviceManager: this keeps
+				// the tracker out of the GUI's device/tracker list while it still
+				// registers on the server (instance.allTrackers) as valid skeleton
+				// input, the same way HumanPoseManager's deviceless computed
+				// trackers (e.g. "human://HEAD") do.
 				tracker = Tracker(
-					device,
+					null,
 					getNextLocalTrackerId(),
 					"$bridgeName:${trackerPosition.designation}",
 					trackerPosition.designation,
@@ -282,8 +284,6 @@ abstract class ProtobufBridge(@JvmField protected val bridgeName: String) : ISte
 					hasRotation = true,
 					isComputed = true,
 				)
-				device.trackers[boneOrdinal] = tracker
-				instance.deviceManager.addDevice(device)
 				instance.registerTracker(tracker)
 				boneTrackers[boneOrdinal] = tracker
 			}
